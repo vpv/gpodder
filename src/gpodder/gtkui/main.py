@@ -33,6 +33,7 @@ import tempfile
 import collections
 import urllib
 import cgi
+import ConfigParser
 
 
 import gpodder
@@ -50,6 +51,7 @@ from gpodder import download
 from gpodder import my
 from gpodder import youtube
 from gpodder import player
+from gpodder import schema
 
 import logging
 logger = logging.getLogger(__name__)
@@ -75,6 +77,7 @@ from gpodder.gtkui.interface.addpodcast import gPodderAddPodcast
 from gpodder.gtkui.download import DownloadStatusModel
 
 from gpodder.gtkui.desktop.welcome import gPodderWelcome
+from gpodder.gtkui.desktop.migrate import gPodderMigrate
 from gpodder.gtkui.desktop.channel import gPodderChannel
 from gpodder.gtkui.desktop.preferences import gPodderPreferences
 from gpodder.gtkui.desktop.shownotes import gPodderShownotes
@@ -312,8 +315,12 @@ class gPodder(BuilderWidget, dbus.service.Object):
         util.idle_add(self.mygpo_client.flush, True)
 
         # First-time users should be asked if they want to see the OPML
+        # and if they want to migrate their 2.x configuration
         if not self.channels:
-            self.on_itemUpdate_activate()
+            if self.migrate_configuration():
+                sys.exit(0)
+            else:
+                self.on_itemUpdate_activate()
         elif self.config.software_update.check_on_startup:
             # Check for software updates from gpodder.org
             diff = time.time() - self.config.software_update.last_check
@@ -3501,6 +3508,65 @@ class gPodder(BuilderWidget, dbus.service.Object):
                 self.commit_changes_to_database)
 
         self.sync_ui.on_synchronize_episodes(self.channels, episodes, force_played)
+
+    def migrate_configuration(self):
+        old_database = os.path.expanduser('~/.config/gpodder/database.sqlite')
+        new_database = gpodder.database_file
+        old_config = os.path.expanduser('~/.config/gpodder/gpodder.conf')
+        new_config = gpodder.config_file
+        new_downloads = gpodder.downloads
+
+        # The new initial gPodder 3 database already exists at this point but
+        # new downloads should not.
+        if os.path.exists(old_database) and os.path.exists(old_config) and not os.path.exists(new_downloads):
+            title = _('Migrate data from gPodder 2.x to gPodder 3')
+            message = _('''Existing gPodder 2.x configuration found.\nDo you want to migrate it to version 3?\n\nAfter the migration gPodder will shut down and needs to be restarted manually. Version 2.x configuration and downloads will no longer be available.''')
+            info = _('Migrating')
+            if not self.show_confirmation(message, title):
+                # Migration not done
+                return False
+
+            progress = ProgressIndicator(title, info, parent=self.get_dialog_parent())
+
+            def finish_migration():
+                progress.on_finished()
+                # Exit after the migration is done, a restart is needed to be
+                # able to use the migrated data.
+                sys.exit(0)
+
+            @util.run_in_background
+            def thread_proc():
+                old_downloads = None
+
+                if os.path.exists(old_config):
+                    parser = ConfigParser.RawConfigParser()
+                    parser.read(old_config)
+                    try:
+                        old_downloads = parser.get('gpodder-conf-1', 'download_dir')
+                    except ConfigParser.NoSectionError:
+                        # The file is empty / section (gpodder-conf-1) not found
+                        pass
+                    except ConfigParser.NoOptionError:
+                        # The section is available, but the key (download_dir) is not
+                        pass
+
+                if old_downloads is None:
+                    # The user has no configuration. This usually happens when
+                    # only the CLI version of gPodder is used. In this case, the
+                    # download directory is most likely the default (bug 1434)
+                    old_downloads = os.path.expanduser('~/gpodder-downloads')
+
+                new_downloads = gpodder.downloads
+
+                if not os.path.exists(old_downloads):
+                    os.makedirs(old_downloads)
+
+                util.make_directory(gpodder.home)
+                schema.convert_gpodder2_db(old_database, new_database)
+                shutil.move(old_downloads, new_downloads)
+                util.idle_add(finish_migration())
+            # Migration done
+            return True
 
 def main(options=None):
     gobject.threads_init()
